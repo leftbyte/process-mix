@@ -3,11 +3,18 @@
 """
 DJ Mix Post-Processing Script
 ==============================
-Applies the following chain to a WAV file:
+Applies the following chain to an audio file (WAV, MP3, ...) or to the audio
+track of a video file (MP4, MOV, MKV - the audio is extracted with ffmpeg first):
   1. EQ       - High-pass at 30 Hz, notch cut at 275 Hz, shelf boost at 11 kHz
   2. Multiband Compression - Low / Mid / High bands compressed independently
-  3. Limiting  - Hard limit at -1.0 dBTP
-  4. Export    - 320 kbps MP3
+  3. Loudness  - Normalize to -14 LUFS
+  4. Limiting  - Lookahead peak limiter (ffmpeg alimiter) so the MP3 stays under -1.0 dBTP
+  5. Export    - 320 kbps MP3, then the MP3 itself is measured (LUFS + true peak)
+
+Usage:
+    python process-mix.py input.mp4                # writes input.mp3 next to it
+    python process-mix.py input.wav output.mp3
+    python process-mix.py input.mp4 --audio-track 2
 
 Modes (--mode):
     full      - Load the entire file into RAM, then process. Lowest disk use,
@@ -17,27 +24,34 @@ Modes (--mode):
                 writes a float32 memmap to disk while measuring LUFS, pass 2
                 applies the loudness gain and pipes PCM to ffmpeg for MP3
                 encode. RAM stays bounded; temp disk roughly equals the input
-                size. The processed audio is bit-exact vs. full mode.
+                size. Its crossovers are minimum-phase IIR filters, so it is
+                close to, but not bit-exact with, full mode.
     auto      - Pick streaming for inputs >= 1 GB, otherwise full. (Default.)
 
 Requirements:
-    pip install pedalboard scipy numpy pydub pyloudnorm
-    ffmpeg must also be installed and on your PATH (for MP3 export)
+    pip install -r requirements.txt   (pedalboard scipy numpy pyloudnorm)
+    ffmpeg must also be installed and on your PATH (extraction, limiting, MP3 export)
     macOS:   brew install ffmpeg
     Windows: https://ffmpeg.org/download.html
 """
 
 import argparse
+import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import numpy as np
 from scipy.signal import butter, sosfiltfilt
-from pedalboard import Pedalboard, HighpassFilter, LowpassFilter, PeakFilter, Compressor, Limiter
+from pedalboard import Pedalboard, HighpassFilter, LowpassFilter, PeakFilter, Compressor
 from pedalboard.io import AudioFile
-from pydub import AudioSegment
 import pyloudnorm as pyln
+
+# Inputs with these extensions are treated as video: their audio track is
+# extracted to a temporary WAV before processing.
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".mkv"}
 
 # Threshold (in bytes) at which --mode auto switches to streaming.
 AUTO_STREAMING_THRESHOLD_BYTES = 1024 * 1024 * 1024  # 1 GB
@@ -81,10 +95,16 @@ HIGH_RATIO          = 1.5
 HIGH_ATTACK_MS      = 5.0
 HIGH_RELEASE_MS     = 80.0
 
-# Limiter
-LIMIT_CEILING_DB    = -1.0     # True peak ceiling - prevents clipping
-# Note: Pedalboard's Limiter only supports threshold and release (no hold parameter)
-# 100ms release is the time it takes the limiter to let go after clamping down
+# Limiter - ffmpeg's alimiter, applied while encoding the MP3.
+# (Pedalboard's Limiter is not used: it adds makeup gain and compresses below
+# its threshold, which pushed mixes ~3.5 dB past the loudness target and over 0 dBTP.)
+LIMIT_CEILING_DB    = -1.0     # True peak ceiling the final MP3 must stay under
+LIMIT_HEADROOM_DB   = 1.0      # Extra margin below the ceiling: MP3 encoding adds
+                               # ~0.6 dB of true peak on top of the limited signal
+LIMIT_OVERSAMPLE    = 4        # Limit at 4x the sample rate so inter-sample (true)
+                               # peaks are caught, not just sample peaks
+LIMIT_ATTACK_MS     = 5.0      # Lookahead / attack time
+LIMIT_RELEASE_MS    = 100.0    # Time to let go after clamping down
 
 # Loudness Normalization
 TARGET_LUFS         = -14.0    # Target integrated loudness (-14 LUFS for SoundCloud/Mixcloud)
@@ -121,11 +141,126 @@ def section(title):
     print(f"{'-' * 50}")
 
 
+# ---------------------------------------------
+# LIMIT + ENCODE (shared by both modes)
+# ---------------------------------------------
+
+def limiter_filter(sample_rate: int) -> str:
+    """ffmpeg filter chain: upsample, then alimiter -- a lookahead peak limiter
+    with auto-level (makeup gain) disabled, so it only turns peaks down -- then
+    back to the original rate."""
+    limit = 10.0 ** ((LIMIT_CEILING_DB - LIMIT_HEADROOM_DB) / 20.0)
+    return (f"aresample={sample_rate * LIMIT_OVERSAMPLE},"
+            f"alimiter=limit={limit:.6f}:attack={LIMIT_ATTACK_MS}:release={LIMIT_RELEASE_MS}"
+            f":level=disabled:latency=enabled,"
+            f"aresample={sample_rate}")
+
+
+def encode_mp3(chunks, sample_rate: int, num_channels: int, output_path: str):
+    """Pipe float32 (channels, frames) chunks through the limiter into a
+    320 kbps MP3."""
+    section("LIMITER + EXPORT")
+    print(f"  Limiter   : ffmpeg alimiter, limit {LIMIT_CEILING_DB - LIMIT_HEADROOM_DB:.1f} dBFS "
+          f"({LIMIT_CEILING_DB} dBTP ceiling - {LIMIT_HEADROOM_DB} dB headroom), "
+          f"{LIMIT_OVERSAMPLE}x oversampled, "
+          f"{LIMIT_ATTACK_MS} ms attack, {LIMIT_RELEASE_MS} ms release")
+    print(f"  Format    : MP3, 320 kbps")
+    print(f"  Output    : {output_path}")
+
+    ffmpeg_cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-f", "f32le", "-ar", str(sample_rate), "-ac", str(num_channels),
+        "-i", "pipe:0",
+        "-af", limiter_filter(sample_rate),
+        "-c:a", "libmp3lame", "-b:a", "320k",
+        output_path,
+    ]
+    proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
+    try:
+        for chunk in chunks:
+            # ffmpeg expects interleaved float32: (channels, frames) -> (frames, channels)
+            proc.stdin.write(np.ascontiguousarray(chunk.T, dtype=np.float32).tobytes())
+    finally:
+        proc.stdin.close()
+        rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg exited with code {rc}")
+    print(f"  File size : {os.path.getsize(output_path) / (1024 * 1024):.1f} MB")
+
+
+def check_output(output_path: str):
+    """Measure the finished MP3 (integrated loudness and true peak, via
+    ffmpeg's EBU R128 meter) so the log reports what was actually delivered."""
+    section("OUTPUT CHECK (measured on the MP3)")
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", output_path,
+         "-af", "ebur128=peak=true", "-f", "null", "-"],
+        capture_output=True, text=True,
+    )
+    summary = result.stderr.rsplit("Summary:", 1)[-1]
+    lufs = re.search(r"I:\s+(-?[\d.]+|-inf) LUFS", summary)
+    peak = re.search(r"Peak:\s+(-?[\d.]+|-inf) dBFS", summary)
+    if not (lufs and peak):
+        print("  !!  Could not measure the output")
+        return
+    lufs, peak = float(lufs.group(1)), float(peak.group(1))
+    print(f"  Integrated loudness : {lufs:.1f} LUFS  (target {TARGET_LUFS})")
+    print(f"  True peak           : {peak:.1f} dBTP  (ceiling {LIMIT_CEILING_DB})")
+    if abs(lufs - TARGET_LUFS) > 1.0:
+        print(f"  !!  Loudness is {lufs - TARGET_LUFS:+.1f} dB off target")
+    if peak > LIMIT_CEILING_DB:
+        print(f"  !!  True peak is over the ceiling - raise LIMIT_HEADROOM_DB")
+
+
+# ---------------------------------------------
+# VIDEO INPUT: extract the audio track
+# ---------------------------------------------
+
+def is_video(path: str) -> bool:
+    return os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS
+
+
+def audio_tracks(video_path: str) -> list:
+    """Describe the audio streams in a video file (in file order)."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=codec_name,sample_rate,channels:stream_tags=title",
+         "-of", "json", video_path],
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(result.stdout).get("streams", [])
+
+
+def extract_audio(video_path: str, wav_path: str, track: int = 1):
+    """Extract audio track `track` (1-based, as OBS numbers them) from a video
+    file to a 16-bit WAV at the source sample rate. No processing is applied."""
+    section("EXTRACT AUDIO")
+    tracks = audio_tracks(video_path)
+    if not tracks:
+        raise RuntimeError(f"No audio tracks in {video_path}")
+    for i, t in enumerate(tracks, start=1):
+        title = t.get("tags", {}).get("title", "")
+        marker = "->" if i == track else "  "
+        print(f"  {marker} Track {i}: {t.get('codec_name')} {t.get('sample_rate')} Hz "
+              f"{t.get('channels')}ch {title}".rstrip())
+    if not 1 <= track <= len(tracks):
+        raise ValueError(f"--audio-track {track} not found; the file has {len(tracks)} audio track(s)")
+    print(f"  Video     : {video_path}")
+    print(f"  WAV       : {wav_path}")
+    subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+         "-i", video_path, "-map", f"0:a:{track - 1}", "-vn",
+         "-c:a", "pcm_s16le", wav_path],
+        check=True,
+    )
+    print(f"  WAV size  : {os.path.getsize(wav_path) / (1024 ** 3):.2f} GB")
+
+
 def _build_streaming_chain(sample_rate: int):
-    """Build the EQ + multiband + limiter chain as four persistent Pedalboard
-    instances (eq, low, mid, high) plus a limiter. Each is reused across all
-    chunks with reset=False so the IIR/compressor/limiter state is continuous --
-    output is bit-exact vs. running the chain on the whole signal at once."""
+    """Build the EQ + multiband chain as four persistent Pedalboard instances
+    (eq, low, mid, high). Each is reused across all chunks with reset=False so
+    the IIR/compressor state is continuous -- output is identical to running
+    the chain on the whole signal at once."""
     eq = Pedalboard([
         HighpassFilter(cutoff_frequency_hz=HP_CUTOFF_HZ),
         PeakFilter(cutoff_frequency_hz=NOTCH_FREQ_HZ, gain_db=NOTCH_GAIN_DB, q=NOTCH_Q),
@@ -149,8 +284,7 @@ def _build_streaming_chain(sample_rate: int):
         Compressor(threshold_db=HIGH_THRESHOLD_DB, ratio=HIGH_RATIO,
                    attack_ms=HIGH_ATTACK_MS, release_ms=HIGH_RELEASE_MS),
     ])
-    limiter = Pedalboard([Limiter(threshold_db=LIMIT_CEILING_DB, release_ms=100.0)])
-    return eq, low_chain, mid_chain, high_chain, limiter
+    return eq, low_chain, mid_chain, high_chain
 
 
 def process_mix_streaming(input_path: str, output_path: str):
@@ -173,15 +307,13 @@ def process_mix_streaming(input_path: str, output_path: str):
     print(f"  Duration   : {int(duration_s // 60)}m {int(duration_s % 60)}s")
 
     # -- Pass 1: process to memmap, accumulate stats --
-    section("EQ + MULTIBAND + LIMITER (pass 1: chunked process to temp)")
+    section("EQ + MULTIBAND (pass 1: chunked process to temp)")
     print(f"  EQ          : HP {HP_CUTOFF_HZ} Hz, notch {NOTCH_FREQ_HZ} Hz {NOTCH_GAIN_DB} dB, "
           f"air {AIR_FREQ_HZ} Hz +{AIR_GAIN_DB} dB")
     print(f"  Crossovers  : {LOW_CROSSOVER_HZ} / {MID_CROSSOVER_HZ} Hz "
-          f"(streaming uses minimum-phase IIR -- bit-exact vs full mode for the "
-          f"compressor+limiter chain)")
-    print(f"  Limiter     : {LIMIT_CEILING_DB} dBTP, 100 ms release")
+          f"(streaming uses minimum-phase IIR crossovers)")
 
-    # Temp memmap holds pre-loudness, post-limiter audio at full precision.
+    # Temp memmap holds pre-loudness audio at full precision.
     tmp_dir = tempfile.gettempdir()
     fd, memmap_path = tempfile.mkstemp(prefix="process-mix-", suffix=".f32.tmp", dir=tmp_dir)
     os.close(fd)
@@ -190,7 +322,7 @@ def process_mix_streaming(input_path: str, output_path: str):
     print(f"  Temp est.   : {estimated_bytes / (1024 ** 3):.2f} GB "
           f"(float32, {num_channels}ch, {total_frames:,} frames)")
 
-    eq, low_chain, mid_chain, high_chain, limiter = _build_streaming_chain(sample_rate)
+    eq, low_chain, mid_chain, high_chain = _build_streaming_chain(sample_rate)
 
     # numpy memmap shape: (channels, frames). Created fresh; will be closed and
     # reopened read-only for pass 2 to avoid accidental writes.
@@ -223,9 +355,6 @@ def process_mix_streaming(input_path: str, output_path: str):
             mi = mid_chain.process(y,  sample_rate, reset=False)
             hi = high_chain.process(y, sample_rate, reset=False)
             y = lo + mi + hi
-            # Limiter (pre-loudness -- final limiter pass is on the loudness-
-            # adjusted signal in pass 2)
-            y = limiter.process(y, sample_rate, reset=False)
 
             out_peak = float(np.max(np.abs(y))) if y.size else 0.0
             if out_peak > peak_processed:
@@ -263,59 +392,25 @@ def process_mix_streaming(input_path: str, output_path: str):
     print(f"  Measured LUFS       : {current_lufs:.2f} LUFS")
     print(f"  Gain adjustment     : {loudness_delta:+.2f} dB  (linear x{gain_lin:.4f})")
 
-    # Final limiter for pass 2 (fresh state -- different signal than pass-1 limiter)
-    final_limiter = Pedalboard([Limiter(threshold_db=LIMIT_CEILING_DB, release_ms=100.0)])
-
-    # -- Pass 2: gain + final limiter, pipe PCM to ffmpeg -> MP3 --
-    section("EXPORT (pass 2: apply gain, pipe to ffmpeg)")
-    print(f"  Format    : MP3")
-    print(f"  Bitrate   : 320 kbps")
-    print(f"  Output    : {output_path}")
-
-    ffmpeg_cmd = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-f", "f32le", "-ar", str(sample_rate), "-ac", str(num_channels),
-        "-i", "pipe:0",
-        "-c:a", "libmp3lame", "-b:a", "320k",
-        output_path,
-    ]
-    print(f"  ffmpeg cmd: {' '.join(ffmpeg_cmd)}")
-
-    proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
-
-    peak_final = 0.0
-    clipped_after = 0
-    frames_done = 0
-    next_progress = progress_every
-
-    try:
+    # -- Pass 2: apply gain, pipe PCM through the limiter to ffmpeg -> MP3 --
+    def gained_chunks():
+        frames_done = 0
+        next_progress = progress_every
         for start in range(0, total_frames, STREAMING_CHUNK_FRAMES):
             end = min(start + STREAMING_CHUNK_FRAMES, total_frames)
             # Copy out of memmap so we can mutate freely
             chunk = np.array(measure_view[:, start:end], dtype=np.float32)
             chunk *= gain_lin
-            chunk = final_limiter.process(chunk, sample_rate, reset=False)
-
-            cp = float(np.max(np.abs(chunk))) if chunk.size else 0.0
-            if cp > peak_final:
-                peak_final = cp
-            clipped_after += int(np.sum(np.abs(chunk) > 1.0))
-
-            # ffmpeg expects interleaved float32. Pedalboard layout is
-            # (channels, frames); transpose to (frames, channels) and
-            # require contiguous before tobytes().
-            interleaved = np.ascontiguousarray(chunk.T)
-            proc.stdin.write(interleaved.tobytes())
-
+            yield chunk
             frames_done += chunk.shape[1]
             if frames_done >= next_progress:
                 pct = 100.0 * frames_done / total_frames
                 print(f"    pass 2: {pct:5.1f}%  ({frames_done:,} / {total_frames:,} frames)")
                 next_progress += progress_every
+
+    try:
+        encode_mp3(gained_chunks(), sample_rate, num_channels, output_path)
     finally:
-        if proc.stdin:
-            proc.stdin.close()
-        rc = proc.wait()
         del measure_view
         del out_memmap
         try:
@@ -323,21 +418,27 @@ def process_mix_streaming(input_path: str, output_path: str):
             print(f"  Removed temp: {memmap_path}")
         except OSError as e:
             print(f"  !!  Could not remove temp file {memmap_path}: {e}")
-        if rc != 0:
-            raise RuntimeError(f"ffmpeg exited with code {rc}")
 
-    print(f"  Final peak  : {20 * np.log10(peak_final) if peak_final > 0 else float('-inf'):.2f} dBFS")
-    if clipped_after > 0:
-        print(f"  !!  {clipped_after:,} samples exceed 0 dBFS after final limiter -- "
-              f"consider lowering LIMIT_CEILING_DB")
-    else:
-        print(f"      No clipping in final output")
-
-    output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"  File size : {output_size_mb:.1f} MB")
+    check_output(output_path)
 
     section("DONE")
     print(f"  Output saved to: {output_path}\n")
+
+
+def run(input_path: str, output_path: str, mode: str = "auto", audio_track: int = 1):
+    """Full workflow. Video input: extract the audio track to a temporary WAV,
+    process it, write the MP3, and delete the WAV. Audio input: process directly."""
+    if not is_video(input_path):
+        process_mix(input_path, output_path, mode=mode)
+        return
+    temp_dir = tempfile.mkdtemp(prefix="process-mix-")
+    try:
+        stem = os.path.splitext(os.path.basename(input_path))[0]
+        wav_path = os.path.join(temp_dir, stem + ".wav")
+        extract_audio(input_path, wav_path, track=audio_track)
+        process_mix(wav_path, output_path, mode=mode)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def process_mix(input_path: str, output_path: str, mode: str = "auto"):
@@ -489,48 +590,17 @@ def process_mix_full(input_path: str, output_path: str):
     print(f"  Verified LUFS       : {verified_lufs:.2f} LUFS")
     print(f"  Peak level          : {peak_db(audio):.2f} dBFS")
 
-    clipped = np.sum(np.abs(audio) > 1.0)
-    if clipped > 0:
-        clipped_db = peak_db(audio)
-        print(f"  !!  Clipped samples  : {clipped:,} samples exceed 0 dBFS "
-              f"(peak {clipped_db:.2f} dBFS) - limiter will catch these next")
-    else:
-        print(f"      No clipping detected after normalization")
+    over_ceiling = np.sum(np.abs(audio) > 10.0 ** (LIMIT_CEILING_DB / 20.0))
+    if over_ceiling > 0:
+        print(f"      {over_ceiling:,} samples above the {LIMIT_CEILING_DB} dB ceiling "
+              f"- the limiter catches these next")
 
-    # Runs AFTER normalization to catch any peaks pushed over the ceiling.
-    section("LIMITER")
-    print(f"  Ceiling (threshold) : {LIMIT_CEILING_DB} dBTP")
-    print(f"  Release             : 100.0 ms")
-    print(f"  Note: Pedalboard's Limiter has no hold parameter (release only)")
-
-    peak_before = peak_db(audio)
-    limiter_chain = Pedalboard([Limiter(threshold_db=LIMIT_CEILING_DB, release_ms=100.0)])
-    audio = limiter_chain(audio, sample_rate)
-    print(f"  Peak level          : {peak_before:.2f} dBFS -> {peak_db(audio):.2f} dBFS")
-
-    # Final clipping check after limiting
-    clipped_after = np.sum(np.abs(audio) > 1.0)
-    if clipped_after > 0:
-        print(f"  !!  {clipped_after:,} samples still exceed 0 dBFS after limiting - "
-              f"consider lowering LIMIT_CEILING_DB")
-    else:
-        print(f"      No clipping in final output")
-
-    section("EXPORT")
-    print(f"  Format    : MP3")
-    print(f"  Bitrate   : 320 kbps")
-    print(f"  Output    : {output_path}")
-
-    temp_wav = output_path.replace(".mp3", "_temp.wav")
-    with AudioFile(temp_wav, 'w', samplerate=sample_rate, num_channels=audio.shape[0]) as f:
-        f.write(audio)
-
-    sound = AudioSegment.from_wav(temp_wav)
-    sound.export(output_path, format="mp3", bitrate="320k")
-    os.remove(temp_wav)
-
-    output_size_mb = os.path.getsize(output_path) / (1024 * 1024)
-    print(f"  File size : {output_size_mb:.1f} MB")
+    # Limiting happens in the encoder pipe, after normalization, to catch any
+    # peaks pushed over the ceiling. Chunks avoid a second full-size copy.
+    chunks = (audio[:, s:s + STREAMING_CHUNK_FRAMES]
+              for s in range(0, audio.shape[1], STREAMING_CHUNK_FRAMES))
+    encode_mp3(chunks, sample_rate, audio.shape[0], output_path)
+    check_output(output_path)
 
     section("DONE")
     print(f"  Output saved to: {output_path}\n")
@@ -543,10 +613,18 @@ def process_mix_full(input_path: str, output_path: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="DJ mix post-processing: EQ, multiband compression, "
-                    "limiting, loudness normalization, MP3 export.",
+                    "loudness normalization, limiting, MP3 export. Accepts an "
+                    "audio file or a video (MP4/MOV/MKV), whose audio is "
+                    "extracted first.",
     )
-    parser.add_argument("input", help="Input WAV file")
-    parser.add_argument("output", help="Output MP3 file")
+    parser.add_argument("input", help="Input audio file (WAV, MP3, ...) or video file (MP4, MOV, MKV)")
+    parser.add_argument("output", nargs="?",
+                        help="Output MP3 file. Default: the input's name with .mp3, next to it")
+    parser.add_argument(
+        "--audio-track", type=int, default=1, metavar="N",
+        help="For video input: which audio track to use, starting at 1 "
+             "(OBS track numbering). Default: 1.",
+    )
     parser.add_argument(
         "--mode", choices=("full", "streaming", "auto"), default="auto",
         help="full = load entire file into RAM (fastest, most memory). "
@@ -556,4 +634,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    process_mix(args.input, args.output, mode=args.mode)
+    output = args.output or os.path.splitext(args.input)[0] + ".mp3"
+    if os.path.abspath(output) == os.path.abspath(args.input):
+        parser.error("the output would overwrite the input; give an output file name")
+
+    try:
+        run(args.input, output, mode=args.mode, audio_track=args.audio_track)
+    except (ValueError, RuntimeError, subprocess.CalledProcessError) as e:
+        sys.exit(f"process-mix: error: {e}")

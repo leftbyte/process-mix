@@ -18,7 +18,13 @@ python3 -m venv .venv
 .venv/bin/python process-mix.py ~/Music/Recordings/OBS/"2026-11-14 20-06-14.mp4"
 ```
 
-This writes `2026-11-14 20-06-14.mp3` next to the video. An hour-long mix takes about 2-3 minutes.
+This writes `2026-11-14 20-06-14.mp3` next to the video. `./run-process-mix.sh` is a shortcut that runs the script with the `.venv` Python and takes the same arguments:
+
+```
+./run-process-mix.sh ~/Music/Recordings/OBS/"2026-11-14 20-06-14.mp4"
+```
+
+ An hour-long mix takes about 2-3 minutes.
 
 ## Requirements
 

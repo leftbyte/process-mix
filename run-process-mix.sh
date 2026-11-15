@@ -2,7 +2,9 @@
 #
 # Wrapper to run process-mix.py with the project's virtualenv.
 #
-# Usage: ./run-process-mix.sh <input.wav> <output.mp3> [extra args...]
+# Usage: ./run-process-mix.sh <input> [output.mp3] [extra args...]
+#   input  - audio file (WAV, MP3, ...) or video (MP4, MOV, M4V, MKV)
+#   output - optional; defaults to the input's name with .mp3
 #
 set -euo pipefail
 
@@ -12,24 +14,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
 SCRIPT="$SCRIPT_DIR/process-mix.py"
 
-if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <input.wav> <output.mp3> [extra args...]" >&2
+if [[ $# -lt 1 ]]; then
+    echo "Usage: $0 <input> [output.mp3] [extra args...]" >&2
     exit 1
 fi
 
 if [[ ! -x "$VENV_PYTHON" ]]; then
     echo "Error: virtualenv python not found at $VENV_PYTHON" >&2
-    echo "Create it first, e.g.: python -m venv .venv && .venv/bin/pip install pedalboard scipy numpy pydub pyloudnorm" >&2
+    echo "Create it first, e.g.: python -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
     exit 1
 fi
 
-INPUT="$1"
-OUTPUT="$2"
-shift 2
-
-if [[ ! -f "$INPUT" ]]; then
-    echo "Error: input file not found: $INPUT" >&2
+if [[ ! -f "$1" ]]; then
+    echo "Error: input file not found: $1" >&2
     exit 1
 fi
 
-exec "$VENV_PYTHON" "$SCRIPT" "$INPUT" "$OUTPUT" "$@"
+exec "$VENV_PYTHON" "$SCRIPT" "$@"
